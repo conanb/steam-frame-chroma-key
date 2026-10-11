@@ -188,6 +188,7 @@ struct DeviceData {
     DF(CreateQueryPool) DF(CmdWriteTimestamp) DF(GetQueryPoolResults) DF(CmdResetQueryPool)
     DF(CmdClearColorImage) DF(CmdResolveImage) DF(CmdDispatch) DF(CmdCopyBufferToImage)
     DF(CreateSampler) DF(CreateComputePipelines) DF(CreateSamplerYcbcrConversion)
+    DF(BindBufferMemory) DF(BindBufferMemory2) DF(MapMemory) DF(UnmapMemory)
 #undef DF
     std::mutex m;
     std::unordered_map<VkImage, ImageInfo> images;
@@ -220,6 +221,13 @@ struct DeviceData {
     std::unordered_set<VkPipelineLayout> ycbcrPl;
     std::unordered_map<VkPipeline, std::string> pipeDesc;
     std::unordered_map<VkPipeline, uint64_t> binds;
+    // camera-pass uniform probe (read-only): where the passthrough tint/opacity lives
+    std::unordered_map<VkBuffer, std::pair<VkDeviceMemory, VkDeviceSize>> bufMem;
+    std::unordered_map<VkDeviceMemory, std::pair<char *, VkDeviceSize>> mapped;   // ptr, map offset
+    std::unordered_map<uint64_t, std::pair<VkBuffer, VkDeviceSize>> setBinding;  // (set ^ binding) -> buffer, offset
+    std::unordered_map<VkCommandBuffer, VkPipeline> cbPipe;
+    VkDescriptorSet camSet = VK_NULL_HANDLE;
+    uint32_t camDynOff = 0, camDynCount = 0;
 };
 
 static std::mutex g_mapMutex;
@@ -312,6 +320,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     DF(CmdSetViewport) DF(CmdSetScissor) DF(CreateQueryPool) DF(CmdWriteTimestamp) DF(GetQueryPoolResults)
     DF(CmdResetQueryPool) DF(CmdClearColorImage) DF(CmdResolveImage) DF(CmdDispatch) DF(CmdCopyBufferToImage)
     DF(CreateSampler) DF(CreateComputePipelines) DF(CreateSamplerYcbcrConversion)
+    DF(BindBufferMemory) DF(BindBufferMemory2) DF(MapMemory) DF(UnmapMemory)
 #undef DF
     if (!d->QueueSubmit2) d->QueueSubmit2 = (PFN_vkQueueSubmit2)gdpa(*out, "vkQueueSubmit2KHR");
     if (!d->CmdBeginRendering) d->CmdBeginRendering = (PFN_vkCmdBeginRendering)gdpa(*out, "vkCmdBeginRenderingKHR");
@@ -879,6 +888,9 @@ static PFN_vkVoidFunction deviceHook(const char *name) {
         HOOK(DestroyDevice) HOOK(CreateShaderModule) HOOK(CreateSampler) HOOK(CreateDescriptorSetLayout)
         HOOK(CreatePipelineLayout) HOOK(CreateGraphicsPipelines) HOOK(CreateComputePipelines) HOOK(CmdBindPipeline)
         HOOK(QueueSubmit) HOOK(QueueSubmit2) HOOK(CreateSamplerYcbcrConversion)
+        HOOK(BindBufferMemory) HOOK(BindBufferMemory2) HOOK(MapMemory) HOOK(UnmapMemory) HOOK(UpdateDescriptorSets)
+        HOOK(CmdBindDescriptorSets)
+        if (!strcmp(name, "vkBindBufferMemory2KHR")) return (PFN_vkVoidFunction)BindBufferMemory2;
         if (!strcmp(name, "vkCreateSamplerYcbcrConversionKHR")) return (PFN_vkVoidFunction)CreateSamplerYcbcrConversion;
         if (!strcmp(name, "vkQueueSubmit2KHR")) return (PFN_vkVoidFunction)QueueSubmit2;
         return nullptr;

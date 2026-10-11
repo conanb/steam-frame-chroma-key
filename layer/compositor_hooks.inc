@@ -180,8 +180,89 @@ static VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cb, VkPipeline
     {
         std::lock_guard<std::mutex> l(d->m);
         d->binds[p]++;
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) d->cbPipe[cb] = p;
     }
     d->CmdBindPipeline(cb, bp, p);
+}
+
+// ---- camera-pass uniform probe.  tracked_camera_reprojection_*_ps outputs
+// camera.rgb * tint.rgb * tint.a (tint = UBO set 0 binding 4, member at +304; a
+// content-aware gradient at +416/+464 can replace tint.rgb).  We only record where
+// that UBO lives and read it through the compositor's own host mapping at summary time.
+static VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice dev, VkBuffer b, VkDeviceMemory mem, VkDeviceSize off) {
+    DeviceData *d = getDev(key(dev));
+    VkResult r = d->BindBufferMemory(dev, b, mem, off);
+    if (r == VK_SUCCESS) { std::lock_guard<std::mutex> l(d->m); d->bufMem[b] = {mem, off}; }
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory2(VkDevice dev, uint32_t n, const VkBindBufferMemoryInfo *bi) {
+    DeviceData *d = getDev(key(dev));
+    VkResult r = d->BindBufferMemory2(dev, n, bi);
+    if (r == VK_SUCCESS) {
+        std::lock_guard<std::mutex> l(d->m);
+        for (uint32_t i = 0; i < n; i++) d->bufMem[bi[i].buffer] = {bi[i].memory, bi[i].memoryOffset};
+    }
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size,
+                                               VkMemoryMapFlags f, void **pp) {
+    DeviceData *d = getDev(key(dev));
+    VkResult r = d->MapMemory(dev, mem, off, size, f, pp);
+    if (r == VK_SUCCESS) { std::lock_guard<std::mutex> l(d->m); d->mapped[mem] = {(char *)*pp, off}; }
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL UnmapMemory(VkDevice dev, VkDeviceMemory mem) {
+    DeviceData *d = getDev(key(dev));
+    {
+        std::lock_guard<std::mutex> l(d->m);
+        d->mapped.erase(mem);
+    }
+    d->UnmapMemory(dev, mem);
+}
+static VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets(VkDevice dev, uint32_t nw, const VkWriteDescriptorSet *w,
+                                                       uint32_t nc, const VkCopyDescriptorSet *c) {
+    DeviceData *d = getDev(key(dev));
+    {
+        std::lock_guard<std::mutex> l(d->m);
+        for (uint32_t i = 0; i < nw; i++)
+            if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                 w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) && w[i].pBufferInfo)
+                for (uint32_t j = 0; j < w[i].descriptorCount; j++)
+                    d->setBinding[(uint64_t)w[i].dstSet ^ (w[i].dstBinding + j)] = {w[i].pBufferInfo[j].buffer,
+                                                                                    w[i].pBufferInfo[j].offset};
+    }
+    d->UpdateDescriptorSets(dev, nw, w, nc, c);
+}
+static VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout pl,
+                                                        uint32_t first, uint32_t n, const VkDescriptorSet *sets,
+                                                        uint32_t ndyn, const uint32_t *dyn) {
+    DeviceData *d = getDev(key(cb));
+    {
+        std::lock_guard<std::mutex> l(d->m);
+        auto it = d->cbPipe.find(cb);
+        if (first == 0 && n > 0 && it != d->cbPipe.end() &&
+            d->pipeDesc[it->second].find("tracked_camera_reprojection") != std::string::npos) {
+            d->camSet = sets[0];
+            d->camDynCount = ndyn;
+            d->camDynOff = ndyn ? dyn[0] : 0;
+        }
+    }
+    d->CmdBindDescriptorSets(cb, bp, pl, first, n, sets, ndyn, dyn);
+}
+static void cameraProbe(DeviceData *d) { // called with d->m held
+    if (!d->camSet) { LOG("camera probe: no camera pass bound yet"); return; }
+    auto sb = d->setBinding.find((uint64_t)d->camSet ^ 4);
+    if (sb == d->setBinding.end()) { LOG("camera probe: set %p binding 4 not seen", (void *)d->camSet); return; }
+    auto bm = d->bufMem.find(sb->second.first);
+    if (bm == d->bufMem.end()) { LOG("camera probe: buffer memory unknown"); return; }
+    auto mp = d->mapped.find(bm->second.first);
+    if (mp == d->mapped.end()) { LOG("camera probe: buffer memory not host-mapped"); return; }
+    VkDeviceSize off = bm->second.second + sb->second.second + d->camDynOff;
+    if (off < mp->second.second) return;
+    const float *u = (const float *)(mp->second.first + (off - mp->second.second));
+    const float *t = u + 304 / 4, *g = u + 416 / 4, *c = u + 464 / 4;
+    LOG("camera probe: tint=(%.3f %.3f %.3f) opacity=%.3f gradient=%.3f corners=(%.2f %.2f %.2f)(%.2f %.2f %.2f) dyn=%u",
+        t[0], t[1], t[2], t[3], g[3], c[0], c[1], c[2], c[4], c[5], c[6], d->camDynCount);
 }
 static void compositorSummary(DeviceData *d) { // called with d->m held, every ~5 s
     std::vector<std::pair<uint64_t, VkPipeline>> v;
@@ -191,4 +272,5 @@ static void compositorSummary(DeviceData *d) { // called with d->m held, every ~
     for (size_t i = 0; i < v.size() && i < 25; i++)
         LOG("  %6llu  %p %s", (unsigned long long)v[i].first, (void *)v[i].second, d->pipeDesc[v[i].second].c_str());
     d->binds.clear();
+    cameraProbe(d);
 }

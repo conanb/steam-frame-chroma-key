@@ -7,12 +7,16 @@ replaces that colour with its own passthrough camera. Valve's native streaming (
 No second video stream is added, the camera image never leaves the headset, and the cost is about 0.3 ms of GPU time
 with no extra frame of latency.
 
-![The Chroma Key panel in the SteamVR dashboard, captured on a Steam Frame](docs/headset_panel.png)
+![The Chroma Key panel in the SteamVR dashboard](docs/panel.png)
 
 What you get:
 
 - **In-headset panel** in the SteamVR dashboard: keying ON/OFF, key colour presets and hue bar, Similarity, Edge
-  softness and Spill sliders.
+  softness, Spill and **Passthrough** brightness sliders.
+- **Full-brightness passthrough**: the room behind the game is as bright as SteamVR's own pass-through view
+  (SteamVR normally dims it while a game runs), adjustable with the Passthrough slider.
+- **Standalone stays stock**: keying only applies while you stream from the PC; standalone apps and Room View
+  behave exactly as normal.
 - **Desktop background switch** (*Key colour* / *Mountains*): with no game running, it makes the PC SteamVR home
   backdrop the key colour, so you see your room around the SteamVR desktop view. Switch back to the default
   mountains with one click.
@@ -88,7 +92,7 @@ cd ~/mr-chroma
 
 ./build.sh && ./install.sh                                     # build the Vulkan layer + helper, install user-scope
 touch ~/.config/mrchroma/enable-compositor                     # opt the compositor in to the layer
-~/.local/share/mrchroma/mrctl set-bool camera forceSceneAlphaBlending 1
+~/.local/share/mrchroma/mrctl set-bool camera forceSceneAlphaBlending 1   # the panel manages this afterwards
 systemctl --user restart steamvr                               # SteamVR restarts and loads the layer (~15 s)
 ```
 
@@ -96,6 +100,7 @@ Wait for SteamVR to come back (put the headset on so it wakes up), reconnect the
 
 ```bash
 ./mrkey.sh chroma 0 1 0 0.32 0.12 0.5      # key pure green: R G B similarity softness spill
+./mrkey.sh passthru 1.6667 1               # passthrough behind the game as bright as the pass-through view
 toggle/install_toggle.sh                   # in-headset dashboard panel (recommended)
 ```
 
@@ -126,6 +131,8 @@ From a copy of this repo on the PC:
      background remain, and lower it if parts of your subject disappear.
    - **Edge softness** sets the width of the fade at edges.
    - **Spill removal** removes the coloured fringe the key colour leaves on edges.
+   - **Passthrough** sets the brightness of the room behind the game (1.00 = SteamVR's normal brightness;
+     higher is brighter).
    - **Desktop background**: *Key colour* shows passthrough around the SteamVR desktop view when no game is running,
      and *Mountains* restores the normal SteamVR home. This needs the PC sync helper. The panel shows *PC in sync*,
      *waiting for PC* or *PC helper not responding*.
@@ -137,6 +144,7 @@ From a shell on the headset you can do the same things:
 ```bash
 ~/mr-chroma/mrtoggle.sh on|off|toggle|status       # keying on/off, keeps the last colour/settings
 ~/mr-chroma/mrkey.sh chroma R G B sim soft spill   # set colour + params (0..1 values)
+~/mr-chroma/mrkey.sh passthru 1.6667 <brightness> # passthrough brightness (1 = normal), "off" = stock
 ~/mr-chroma/mrkey.sh rect                          # debug: key a fixed rectangle in the middle of each eye
 ~/mr-chroma/mrtoggle.sh bg on|off|toggle|status    # PC desktop background: key colour / mountains
 ```
@@ -177,7 +185,17 @@ times within 120 s with the layer loaded, the layer stops loading and writes
    memory for a patched SPIR-V. The patched shader computes alpha from a CbCr-distance chroma key, with smoothstep
    edge softness and spill suppression, and writes premultiplied `(rgb·a, a)`.
 
-The patched shader is generated **on your headset** from your SteamVR install's own shader, so no Valve files are
+**Standalone.** `forceSceneAlphaBlending` is a global setting, but only the streamed scene is keyed; native apps
+and SteamVR Home don't write full alpha, so the room would show faintly through everything in standalone. The panel
+therefore keeps the setting on only while a PC stream (`vrlink`) is running, and removes it otherwise.
+
+**Passthrough brightness.** While a game streams with the dashboard up, the compositor draws the camera at tint 0.7
+and opacity 0.6; SteamVR's own pass-through view uses opacity 1.0. `mrkey.sh passthru <match> <brightness>` patches the
+two camera shaders (`tracked_camera_reprojection_simplified[_sharpen]_rgb_nv12_ps`) so the colour uses
+`min(opacity × match, 1)` (1.6667 makes both views equally bright, fades still work) and scales the tint by
+`brightness` (the Passthrough slider).
+
+The patched shaders are generated **on your headset** from your SteamVR install's own shader, so no Valve files are
 redistributed here. Dashboards and overlays are drawn afterwards with normal alpha, so they stay opaque. Stereo,
 tracking and reprojection are the compositor's own.
 
@@ -187,10 +205,11 @@ tracking and reprojection are the compositor's own.
 |---|---|
 | `layer/mrchroma_layer.cpp`, `layer/compositor_hooks.inc` | The Vulkan layer. It loads only into `vrcompositor` (opt-in flag file) and `vrlink` (log only). Every other process gets "Skipping layer" from the loader. |
 | `tools/gen_key_spv.py` | Patches the compositor shader disassembly into a rect-test or chroma-key variant, then assembles and validates it. |
-| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill`. Regenerates the shader and hot-reloads compositor shaders (`vrcmd --reload-shaders`). |
+| `tools/gen_cam_spv.py` | Patches the two passthrough camera shaders for brightness (`mrkey.sh passthru`). |
+| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill` / `passthru match brightness`. Regenerates the shader and hot-reloads compositor shaders (`vrcmd --reload-shaders`). |
 | `mrtoggle.sh` | `on` / `off` / `toggle` / `status`, plus `bg ...`. Re-enables the last generated shader without regenerating it. |
 | `tools/mrctl.cpp` | OpenVR helper: get/set settings, measure frame timing (`mrctl timing 8`). |
-| `toggle/` | The SteamVR dashboard overlay. It is software-rendered with FreeType via `SetOverlayRaw` and autolaunched through a user app manifest (`mrchroma.toggle`). `mrtoggle_overlay --render out.ppm` renders the layout without SteamVR. |
+| `toggle/` | The SteamVR dashboard overlay. It is software-rendered with FreeType via `SetOverlayRaw` and autolaunched through a user app manifest (`mrchroma.toggle`). It also keeps `forceSceneAlphaBlending` on only while streaming. `mrtoggle_overlay --render out.ppm` renders the layout without SteamVR. |
 | `pc/mrchroma_pcsync.pyw`, `pc/vrsettings_win.py` | PC helper that keeps the PC SteamVR home background in step with the headset. It writes through SteamVR's public settings API (`IVRSettings` in `openvr_api.dll`), applies changes live and idles while SteamVR is closed. Log: `%LOCALAPPDATA%\mrchroma\pcsync.log`. |
 | `pc/mrchroma_panel.pyw` | PC control panel (tkinter): eyedropper, colour picker, sliders, all over `ssh frame`. |
 | `install.sh` / `uninstall.sh` | User-scope install and full rollback. |
@@ -212,7 +231,8 @@ because they draw their own background.
 
 ## Fragility
 
-The patcher anchors on `OpStore %504 %994` and a few IDs in this exact SteamVR build's shader. After a SteamVR update,
+The patchers anchor on this SteamVR build's shader code (`OpStore %504 %994` for the key, the uniform layout for
+the camera shaders). After a SteamVR update,
 `gen_key_spv.py` refuses to generate a shader ("unexpected shader layout") instead of producing a broken one. If the
 compositor rejects a patched module, the layer falls back to the original shader. The shader filename and the
 `forceSceneAlphaBlending` setting are internal SteamVR details that Valve can change at any time. Porting to a new

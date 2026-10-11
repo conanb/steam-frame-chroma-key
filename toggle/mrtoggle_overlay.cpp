@@ -1,5 +1,5 @@
 // mrtoggle_overlay — SteamVR dashboard overlay: chroma-key on/off, key colour,
-// similarity / edge softness / spill.  Public OpenVR overlay API only.
+// similarity / edge softness / spill, passthrough brightness.  Public OpenVR overlay API only.
 //
 // Drives the same scripts as the PC panel:
 //   mrtoggle.sh toggle|status                  on/off (keeps the generated shader)
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -26,25 +27,30 @@
 using namespace vr;
 using Clock = std::chrono::steady_clock;
 
-static const int W = 1024, H = 830;
+static const int W = 1024, H = 930;
 
 // ---------------------------------------------------------------- settings
 struct Key {
     float r = 0, g = 1, b = 0;
     float thr = 0.32f, soft = 0.12f, spill = 0.5f;
+    float bright = 1.0f;   // passthrough brightness (mrkey.sh passthru), not part of the key shader
 };
 struct Range { const char *label; float Key::*field; float lo, hi; };
 static const Range kSliders[] = {
     {"Similarity", &Key::thr, 0.02f, 0.70f},
     {"Edge softness", &Key::soft, 0.005f, 0.30f},
     {"Spill removal", &Key::spill, 0.0f, 1.0f},
+    {"Passthrough", &Key::bright, 0.5f, 2.5f},
 };
+static const int kNumSliders = 4, kBrightSlider = 3;
+// keyed view draws the camera at opacity 0.6 vs 1.0 in pass-only; this gain matches them
+static const char *kPassthruGain = "1.6667";
 struct Preset { const char *name; float r, g, b; };
 static const Preset kPresets[] = {
     {"Green", 0, 1, 0}, {"Blue", 0, 0, 1}, {"Magenta", 1, 0, 1}, {"Red", 1, 0, 0}, {"Cyan", 0, 1, 1},
 };
 
-static std::string g_home, g_toggle, g_mrkey, g_state;
+static std::string g_home, g_toggle, g_mrkey, g_state, g_passthru;
 
 static std::string runLine(const std::string &cmd) {
     FILE *p = popen(cmd.c_str(), "r");
@@ -57,15 +63,61 @@ static std::string runLine(const std::string &cmd) {
     return s;
 }
 
+// The key shader only patches the streamed (vrlink) scene pass.  In standalone the
+// compositor draws native apps / SteamVR Home with other shaders whose alpha is not 1,
+// so camera/forceSceneAlphaBlending would bleed passthrough through everything.
+// Keep it on only while a vrlink stream is running.
+static bool streaming() {
+    DIR *d = opendir("/proc");
+    if (!d) return false;
+    bool found = false;
+    while (dirent *e = readdir(d)) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        // argv[0], not comm: vrlink renames its main thread to "vrlinkrunthread"
+        char path[64], arg0[256] = {};
+        snprintf(path, sizeof path, "/proc/%s/cmdline", e->d_name);
+        if (FILE *f = fopen(path, "r")) {
+            size_t n = fread(arg0, 1, sizeof arg0 - 1, f);
+            arg0[n] = 0;
+            const char *base = strrchr(arg0, '/');
+            if (!strcmp(base ? base + 1 : arg0, "vrlink")) found = true;
+            fclose(f);
+        }
+        if (found) break;
+    }
+    closedir(d);
+    return found;
+}
+static void syncSceneAlpha() {
+    struct stat st;
+    if (stat((g_home + "/.config/mrchroma/enable-compositor").c_str(), &st) != 0) return;   // not ours to manage
+    bool want = streaming();
+    EVRSettingsError se = VRSettingsError_None;
+    bool cur = VRSettings()->GetBool("camera", "forceSceneAlphaBlending", &se);   // unset reads as false
+    if (cur == want) return;
+    if (want) VRSettings()->SetBool("camera", "forceSceneAlphaBlending", true, &se);
+    else VRSettings()->RemoveKeyInSection("camera", "forceSceneAlphaBlending", &se);
+    fprintf(stderr, "forceSceneAlphaBlending -> %d (%s)\n", want, want ? "streaming" : "standalone");
+}
+
 static bool readState(Key &k) {
     FILE *f = fopen(g_state.c_str(), "r");
     if (!f) return false;
     char mode[32];
-    Key n;
+    Key n = k;   // keeps bright, which lives in passthru.state
     int got = fscanf(f, "%31s %f %f %f %f %f %f", mode, &n.r, &n.g, &n.b, &n.thr, &n.soft, &n.spill);
     fclose(f);
     if (got == 7 && !strcmp(mode, "chroma")) { k = n; return true; }
     return false;
+}
+
+static void readPassthru(Key &k) {   // "<gain> <brightness>" or "off" (written by mrkey.sh passthru)
+    float g, b;
+    FILE *f = fopen(g_passthru.c_str(), "r");
+    k.bright = 1.0f;
+    if (!f) return;
+    if (fscanf(f, "%f %f", &g, &b) == 2) k.bright = b;
+    fclose(f);
 }
 
 static time_t mtimeOf(const std::string &p) {
@@ -156,13 +208,13 @@ static const Rect kToggle = {664, 28, 996, 128};
 static Rect presetRect(int i) { return {300.f + i * 140, 168, 300.f + i * 140 + 120, 248}; }
 static const Rect kHue = {300, 290, 996, 350};
 static Rect sliderRect(int i) { return {300, 418.f + i * 100, 996, 466.f + i * 100}; }
-static const Rect kBgOn = {300, 706, 644, 772}, kBgOff = {652, 706, 996, 772};
+static const Rect kBgOn = {300, 806, 644, 872}, kBgOff = {652, 806, 996, 872};
 
 // PC home background: wanted state lives on the headset, the PC helper acks what it applied
 struct PcBg { bool on = false; std::string applied; };
 enum Sync { SyncOk, SyncWaiting, SyncStale };
 
-enum Drag { DragNone = -1, DragHue = 10 };   // 0..2 = slider index
+enum Drag { DragNone = -1, DragHue = 10 };   // 0..3 = slider index
 
 static void render(Canvas &cv, const Key &k, const std::string &status, bool busy, int drag, const PcBg &bg, Sync sync) {
     cv.clear();
@@ -197,7 +249,7 @@ static void render(Canvas &cv, const Key &k, const std::string &status, bool bus
     cv.ring(hx - 10, kHue.y0, hx + 10, kHue.y1, 8, drag == DragHue ? 6 : 4, 0xffffff);
     cv.text("Hue", 40, 335, 30, 0xb0b0b0);
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < kNumSliders; i++) {
         const Range &s = kSliders[i];
         Rect r = sliderRect(i);
         float v = k.*(s.field), t = (v - s.lo) / (s.hi - s.lo);
@@ -211,8 +263,8 @@ static void render(Canvas &cv, const Key &k, const std::string &status, bool bus
         cv.text(buf, int(r.x1), int(r.y0 - 6), 26, 0x9a9a9a, false, 2);
     }
     // desktop (PC home) background
-    cv.text("Desktop", 40, 734, 34, 0xc8c8c8);
-    cv.text("background", 40, 770, 34, 0xc8c8c8);
+    cv.text("Desktop", 40, 834, 34, 0xc8c8c8);
+    cv.text("background", 40, 870, 34, 0xc8c8c8);
     for (int i = 0; i < 2; i++) {
         const Rect &r = i == 0 ? kBgOn : kBgOff;
         bool sel = (i == 0) == bg.on;
@@ -223,7 +275,7 @@ static void render(Canvas &cv, const Key &k, const std::string &status, bool bus
                 sel ? 0xffffff : 0xa0a0a0, sel, 1);
     }
     const char *st = sync == SyncOk ? "PC in sync" : sync == SyncWaiting ? "waiting for PC..." : "PC helper not responding";
-    cv.text(st, 996, 700, 22, sync == SyncOk ? 0x5ae678 : sync == SyncWaiting ? 0xe0b050 : 0xeb5f55, false, 2);
+    cv.text(st, 996, 800, 22, sync == SyncOk ? 0x5ae678 : sync == SyncWaiting ? 0xe0b050 : 0xeb5f55, false, 2);
     cv.text(on ? "Changes apply when you release the trigger"
                : "Changing colour or sliders turns keying back on", W / 2, H - 22, 24, 0x80838c, false, 1);
 }
@@ -236,6 +288,7 @@ int main(int argc, char **argv) {
     std::string dir = g_toggle.substr(0, g_toggle.rfind('/'));
     g_mrkey = dir + "/mrkey.sh";
     g_state = g_home + "/.local/share/mrchroma/mrkey.state";
+    g_passthru = g_home + "/.local/share/mrchroma/passthru.state";
     std::string self = argv[0];
     char real[4096];
     if (realpath("/proc/self/exe", real)) self = real;
@@ -283,7 +336,8 @@ int main(int argc, char **argv) {
 
     Key key;
     readState(key);
-    time_t stateMtime = mtimeOf(g_state);
+    readPassthru(key);
+    time_t stateMtime = mtimeOf(g_state), passthruMtime = mtimeOf(g_passthru);
     std::string status = runLine(g_toggle + " status");
     const std::string bgWantPath = g_home + "/.config/mrchroma/pcbg";
     const std::string bgAckPath = g_home + "/.local/share/mrchroma/pcbg.applied";
@@ -364,7 +418,7 @@ int main(int argc, char **argv) {
             switch (ev.eventType) {
             case VREvent_MouseButtonDown:
                 if (kHue.in(x, y)) { drag = DragHue; setFromX(DragHue, x); }
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < kNumSliders; i++) {
                     Rect r = sliderRect(i);
                     Rect hit = {r.x0 - 30, r.y0 - 20, r.x1 + 30, r.y1 + 20};
                     if (hit.in(x, y)) { drag = i; setFromX(i, x); }
@@ -374,7 +428,13 @@ int main(int argc, char **argv) {
                 if (drag != DragNone) setFromX(drag, x);
                 break;
             case VREvent_MouseButtonUp:
-                if (drag != DragNone) {
+                if (drag == kBrightSlider) {
+                    setFromX(drag, x);
+                    drag = DragNone;
+                    char buf[256];
+                    snprintf(buf, sizeof buf, "%s passthru %s %.3f", g_mrkey.c_str(), kPassthruGain, key.bright);
+                    submit(buf);
+                } else if (drag != DragNone) {
                     setFromX(drag, x);
                     drag = DragNone;
                     applyKey();
@@ -412,10 +472,13 @@ int main(int argc, char **argv) {
         if (wasBusy != busy) { wasBusy = busy; dirty = true; }
         if (!busy && drag == DragNone && now - lastPoll > std::chrono::milliseconds(700)) {
             lastPoll = now;
+            syncSceneAlpha();
             std::string st = runLine(g_toggle + " status");
             if (st != status) { status = st; dirty = true; }
             time_t mt = mtimeOf(g_state);
             if (mt != stateMtime) { stateMtime = mt; if (readState(key)) dirty = true; }
+            mt = mtimeOf(g_passthru);
+            if (mt != passthruMtime) { passthruMtime = mt; readPassthru(key); dirty = true; }
             bool want = readWord(bgWantPath) == "on";
             std::string ack = readWord(bgAckPath);
             if (want != bg.on || ack != bg.applied) { bg.on = want; bg.applied = ack; dirty = true; }
