@@ -76,11 +76,11 @@ def ssh(cmd, timeout=10):
 
 
 def parse(line, last_rgb):
-    """'chroma R G B thr soft spill|on' -> ((r,g,b), 'on')"""
+    """'chroma|reverse R G B thr soft spill|on' -> ((r,g,b), 'on')"""
     state, _, bg = line.partition("|")
     rgb = last_rgb
     f = state.split()
-    if len(f) >= 4 and f[0] == "chroma":
+    if len(f) >= 4 and f[0] in ("chroma", "reverse"):
         try:
             rgb = tuple(max(0.0, min(1.0, float(x))) for x in f[1:4])
         except ValueError:

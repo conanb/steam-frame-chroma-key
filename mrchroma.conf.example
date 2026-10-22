@@ -11,6 +11,8 @@ spill = 0.5
 # rect mode: normalized x0 y0 x1 y1 of the keyed rectangle (per eye image)
 rect = 0.30 0.30 0.70 0.70
 invert = 0
+# Camera key mode: changed by mrkey.sh reverse and cleared by off/chroma.
+reverse = 0
 # only process exported colour targets at least this wide; -1 target = auto
 min_width = 1024
 target = -1

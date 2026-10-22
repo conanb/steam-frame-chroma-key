@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------- compositor role
 // Identify compositor shaders by hashing the SPIR-V files on disk, flag the
 // pipelines that sample through a YCbCr (NV12) immutable sampler, and
-// optionally substitute a patched SPIR-V for a named shader.
+// optionally substitute a patched SPIR-V for a named shader. Camera key also
+// changes the matching camera pipeline's blend factors.
 // (#included into mrchroma_layer.cpp)
 #include <dirent.h>
 
@@ -52,6 +53,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkS
     VkShaderModuleCreateInfo mci = *ci;
     std::vector<char> repl;
     std::string tag;
+    bool reverseOverride = false;
     if (!name.empty()) {
         loadConfig(false);
         Config c = cfg();
@@ -62,6 +64,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkS
                 mci.pCode = (const uint32_t *)repl.data();
                 mci.codeSize = repl.size();
                 tag = " OVERRIDDEN by " + o.second;
+                reverseOverride = c.reverse &&
+                    (name == "tracked_camera_reprojection_simplified_rgb_nv12_ps.spv" ||
+                     name == "tracked_camera_reprojection_simplified_sharpen_rgb_nv12_ps.spv");
             } else {
                 LOG("override for %s: bad SPIR-V file %s, ignored", name.c_str(), o.second.c_str());
             }
@@ -71,6 +76,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkS
     if (r != VK_SUCCESS && !tag.empty()) { // patched shader rejected: fall back to the original
         LOG("override of %s failed (%d), using original", name.c_str(), r);
         tag.clear();
+        reverseOverride = false;
         r = d->CreateShaderModule(dev, ci, a, out);
     }
     if (r != VK_SUCCESS) return r;
@@ -78,8 +84,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkS
     snprintf(hs, sizeof hs, "%016llx", (unsigned long long)h);
     std::lock_guard<std::mutex> l(d->m);
     d->modName[*out] = name.empty() ? std::string("?") + hs : name;
+    if (reverseOverride) d->reverseMods.insert(*out);
     LOG("ShaderModule %p %s (%zu B)%s", (void *)*out, d->modName[*out].c_str(), ci->codeSize, tag.c_str());
     return r;
+}
+static VKAPI_ATTR void VKAPI_CALL DestroyShaderModule(VkDevice dev, VkShaderModule mod, const VkAllocationCallbacks *a) {
+    DeviceData *d = getDev(key(dev));
+    {
+        std::lock_guard<std::mutex> l(d->m);
+        d->modName.erase(mod);
+        d->reverseMods.erase(mod);
+    }
+    d->DestroyShaderModule(dev, mod, a);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL CreateSampler(VkDevice dev, const VkSamplerCreateInfo *ci,
@@ -136,7 +152,59 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice dev, VkPi
                                                               const VkGraphicsPipelineCreateInfo *ci,
                                                               const VkAllocationCallbacks *a, VkPipeline *out) {
     DeviceData *d = getDev(key(dev));
-    VkResult r = d->CreateGraphicsPipelines(dev, pc, n, ci, a, out);
+    loadConfig(false);
+    const bool reverse = cfg().reverse;
+    std::vector<VkGraphicsPipelineCreateInfo> patched(ci, ci + n);
+    std::vector<VkPipelineColorBlendStateCreateInfo> blends(n);
+    std::vector<std::vector<VkPipelineColorBlendAttachmentState>> attachments(n);
+    std::vector<bool> reversed(n, false);
+    if (reverse) {
+        std::lock_guard<std::mutex> l(d->m);
+        for (uint32_t i = 0; i < n; i++) {
+            bool camera = false;
+            for (uint32_t s = 0; s < ci[i].stageCount; s++) {
+                auto it = d->modName.find(ci[i].pStages[s].module);
+                if (d->reverseMods.count(ci[i].pStages[s].module) && it != d->modName.end() &&
+                    (it->second == "tracked_camera_reprojection_simplified_rgb_nv12_ps.spv" ||
+                     it->second == "tracked_camera_reprojection_simplified_sharpen_rgb_nv12_ps.spv")) camera = true;
+            }
+            if (!camera) continue;
+            const auto *b = ci[i].pColorBlendState;
+            if (!b || b->logicOpEnable || !b->attachmentCount || !b->pAttachments) {
+                LOG("reverse: camera pipeline has no usable colour blend state");
+                continue;
+            }
+            const auto &old = b->pAttachments[0];
+            if (!old.blendEnable || old.srcColorBlendFactor != VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA ||
+                old.dstColorBlendFactor != VK_BLEND_FACTOR_ONE || old.colorBlendOp != VK_BLEND_OP_ADD) {
+                LOG("reverse: unexpected camera blend factors src=%d dst=%d op=%d", old.srcColorBlendFactor,
+                    old.dstColorBlendFactor, old.colorBlendOp);
+                continue;
+            }
+            attachments[i].assign(b->pAttachments, b->pAttachments + b->attachmentCount);
+            auto &a0 = attachments[i][0];
+            a0.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            a0.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            a0.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            a0.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            a0.alphaBlendOp = VK_BLEND_OP_ADD;
+            blends[i] = *b;
+            blends[i].pAttachments = attachments[i].data();
+            patched[i].pColorBlendState = &blends[i];
+            reversed[i] = true;
+        }
+    }
+    VkResult r = d->CreateGraphicsPipelines(dev, pc, n, patched.data(), a, out);
+    if (r != VK_SUCCESS && std::find(reversed.begin(), reversed.end(), true) != reversed.end()) {
+        LOG("reverse: camera blend pipeline rejected (%d), retrying original", r);
+        for (uint32_t i = 0; i < n; i++) {
+            if (out[i]) d->DestroyPipeline(dev, out[i], a);
+            out[i] = VK_NULL_HANDLE;
+        }
+        r = d->CreateGraphicsPipelines(dev, pc, n, ci, a, out);
+        std::fill(reversed.begin(), reversed.end(), false);
+        std::copy(ci, ci + n, patched.begin());
+    }
     std::lock_guard<std::mutex> l(d->m);
     for (uint32_t i = 0; i < n; i++) {
         if (!out[i]) continue;
@@ -146,8 +214,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice dev, VkPi
             desc += (s ? "+" : "") + (it != d->modName.end() ? it->second : std::string("?"));
         }
         if (d->ycbcrPl.count(ci[i].layout)) desc += " [YCBCR]";
-        if (ci[i].pColorBlendState && ci[i].pColorBlendState->attachmentCount) {
-            auto &b = ci[i].pColorBlendState->pAttachments[0];
+        if (reversed[i]) desc += " [REVERSE KEY BLEND]";
+        if (patched[i].pColorBlendState && patched[i].pColorBlendState->attachmentCount) {
+            auto &b = patched[i].pColorBlendState->pAttachments[0];
             char bs[96];
             snprintf(bs, sizeof bs, " blend=%d src=%d dst=%d srcA=%d dstA=%d mask=%x", b.blendEnable,
                      b.srcColorBlendFactor, b.dstColorBlendFactor, b.srcAlphaBlendFactor, b.dstAlphaBlendFactor,

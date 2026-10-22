@@ -3,7 +3,7 @@
 //
 // Drives the same scripts as the PC panel:
 //   mrtoggle.sh toggle|status                  on/off (keeps the generated shader)
-//   mrkey.sh chroma R G B thr soft spill       regenerate + hot-reload (turns keying on)
+//   mrkey.sh chroma|reverse R G B thr soft spill  regenerate + hot-reload
 // and polls mrtoggle.sh status / mrkey.state so PC-side changes show up here.
 // The UI is software-rendered (FreeType text) and uploaded with SetOverlayRaw.
 #include <openvr.h>
@@ -34,6 +34,7 @@ struct Key {
     float r = 0, g = 1, b = 0;
     float thr = 0.32f, soft = 0.12f, spill = 0.5f;
     float bright = 1.0f;   // passthrough brightness (mrkey.sh passthru), not part of the key shader
+    bool reverse = false;
 };
 struct Range { const char *label; float Key::*field; float lo, hi; };
 static const Range kSliders[] = {
@@ -107,7 +108,11 @@ static bool readState(Key &k) {
     Key n = k;   // keeps bright, which lives in passthru.state
     int got = fscanf(f, "%31s %f %f %f %f %f %f", mode, &n.r, &n.g, &n.b, &n.thr, &n.soft, &n.spill);
     fclose(f);
-    if (got == 7 && !strcmp(mode, "chroma")) { k = n; return true; }
+    if (got == 7 && (!strcmp(mode, "chroma") || !strcmp(mode, "reverse"))) {
+        n.reverse = !strcmp(mode, "reverse");
+        k = n;
+        return true;
+    }
     return false;
 }
 
@@ -205,6 +210,7 @@ static float hueOf(float r, float g, float b) {
 // ---------------------------------------------------------------- layout
 struct Rect { float x0, y0, x1, y1; bool in(float x, float y) const { return x >= x0 && x < x1 && y >= y0 && y < y1; } };
 static const Rect kToggle = {664, 28, 996, 128};
+static const Rect kModeScene = {40, 122, 322, 160}, kModeCamera = {334, 122, 640, 160};
 static Rect presetRect(int i) { return {300.f + i * 140, 168, 300.f + i * 140 + 120, 248}; }
 static const Rect kHue = {300, 290, 996, 350};
 static Rect sliderRect(int i) { return {300, 418.f + i * 100, 996, 466.f + i * 100}; }
@@ -227,6 +233,14 @@ static void render(Canvas &cv, const Key &k, const std::string &status, bool bus
     cv.rrect(kToggle.x0, kToggle.y0, kToggle.x1, kToggle.y1, 50, busy ? 0x34343a : on ? 0x173a22 : 0x3d1d1d);
     cv.ring(kToggle.x0, kToggle.y0, kToggle.x1, kToggle.y1, 50, 6, tc);
     cv.text(busy ? "..." : on ? "ON" : "OFF", (kToggle.x0 + kToggle.x1) / 2, 103, 64, tc, true, 1);
+    for (int i = 0; i < 2; i++) {
+        const Rect &r = i == 0 ? kModeScene : kModeCamera;
+        bool selected = (i == 1) == k.reverse;
+        cv.rrect(r.x0, r.y0, r.x1, r.y1, 12, selected ? 0x2b4f8a : 0x2a2c33);
+        cv.ring(r.x0, r.y0, r.x1, r.y1, 12, selected ? 3 : 1, selected ? 0x8fb8ff : 0x4a4d57);
+        cv.text(i == 0 ? "Virtual key" : "Camera key", (r.x0 + r.x1) / 2, int(r.y1 - 10), 22,
+                selected ? 0xffffff : 0xa0a0a0, selected, 1);
+    }
 
     // key colour
     cv.text("Key colour", 40, 200, 34, 0xc8c8c8);
@@ -390,8 +404,8 @@ int main(int argc, char **argv) {
     };
     auto applyKey = [&] {
         char buf[256];
-        snprintf(buf, sizeof buf, "%s chroma %.4f %.4f %.4f %.4f %.4f %.4f", g_mrkey.c_str(), key.r, key.g, key.b,
-                 key.thr, key.soft, key.spill);
+        snprintf(buf, sizeof buf, "%s %s %.4f %.4f %.4f %.4f %.4f %.4f", g_mrkey.c_str(),
+                 key.reverse ? "reverse" : "chroma", key.r, key.g, key.b, key.thr, key.soft, key.spill);
         submit(buf);
     };
 
@@ -441,6 +455,10 @@ int main(int argc, char **argv) {
                     status = "on";
                 } else if (kToggle.in(x, y)) {
                     submit(g_toggle + " toggle");
+                } else if (kModeScene.in(x, y) || kModeCamera.in(x, y)) {
+                    key.reverse = kModeCamera.in(x, y);
+                    applyKey();
+                    status = "on";
                 } else if (kBgOn.in(x, y) || kBgOff.in(x, y)) {
                     bg.on = kBgOn.in(x, y);
                     submit(g_toggle + (bg.on ? " bg on" : " bg off"));

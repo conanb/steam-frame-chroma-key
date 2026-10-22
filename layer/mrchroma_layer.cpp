@@ -75,12 +75,13 @@ struct Config {
     int target = -1;                   // -1 = auto; otherwise index into candidate list
     int logEvents = 4000;              // detailed event budget in log mode
     bool invert = false;               // rect mode: key outside instead of inside
+    bool reverse = false;              // camera pixels matching the key reveal the scene
     // compositor role: replace a named compositor shader with a patched SPIR-V file
     std::vector<std::pair<std::string, std::string>> overrides;
 };
 static Config g_cfg;
 static std::mutex g_cfgMutex;
-static time_t g_cfgMtime = 0;
+static timespec g_cfgMtime = {};
 static std::string cfgPath() {
     const char *e = getenv("MRCHROMA_CONFIG");
     if (e) return e;
@@ -91,8 +92,9 @@ static void loadConfig(bool force) {
     struct stat st;
     std::string p = cfgPath();
     if (stat(p.c_str(), &st) != 0) return;
-    if (!force && st.st_mtime == g_cfgMtime) return;
-    g_cfgMtime = st.st_mtime;
+    std::lock_guard<std::mutex> l(g_cfgMutex);
+    if (!force && st.st_mtim.tv_sec == g_cfgMtime.tv_sec && st.st_mtim.tv_nsec == g_cfgMtime.tv_nsec) return;
+    g_cfgMtime = st.st_mtim;
     FILE *f = fopen(p.c_str(), "r");
     if (!f) return;
     Config c;
@@ -116,17 +118,17 @@ static void loadConfig(bool force) {
         else if (K == "target") c.target = atoi(v);
         else if (K == "log_events") c.logEvents = atoi(v);
         else if (K == "invert") c.invert = atoi(v) != 0;
+        else if (K == "reverse") c.reverse = atoi(v) != 0;
         else if (K == "override") {
             char a[128], b[256];
             if (sscanf(v, "%127s %255s", a, b) == 2) c.overrides.emplace_back(a, b);
         }
     }
     fclose(f);
-    std::lock_guard<std::mutex> l(g_cfgMutex);
     g_cfg = c;
-    LOG("config: mode=%d key=%.2f,%.2f,%.2f thr=%.3f soft=%.3f spill=%.2f rect=%.2f,%.2f,%.2f,%.2f minw=%d target=%d",
-        c.mode, c.key[0], c.key[1], c.key[2], c.threshold, c.softness, c.spill, c.rect[0], c.rect[1], c.rect[2],
-        c.rect[3], c.minWidth, c.target);
+    LOG("config: mode=%d reverse=%d key=%.2f,%.2f,%.2f thr=%.3f soft=%.3f spill=%.2f rect=%.2f,%.2f,%.2f,%.2f minw=%d target=%d",
+        c.mode, c.reverse, c.key[0], c.key[1], c.key[2], c.threshold, c.softness, c.spill, c.rect[0], c.rect[1],
+        c.rect[2], c.rect[3], c.minWidth, c.target);
 }
 static Config cfg() {
     std::lock_guard<std::mutex> l(g_cfgMutex);
@@ -182,7 +184,7 @@ struct DeviceData {
     DF(CmdEndRenderPass2) DF(CmdBeginRendering) DF(CmdEndRendering) DF(CmdCopyImage) DF(CmdBlitImage)
     DF(QueueSubmit) DF(QueueSubmit2) DF(CreateSwapchainKHR) DF(BeginCommandBuffer) DF(EndCommandBuffer)
     DF(CmdPipelineBarrier) DF(CmdBindPipeline) DF(CmdDraw) DF(CmdBindDescriptorSets) DF(CmdPushConstants)
-    DF(CreateShaderModule) DF(DestroyShaderModule) DF(CreatePipelineLayout) DF(CreateGraphicsPipelines)
+    DF(CreateShaderModule) DF(DestroyShaderModule) DF(CreatePipelineLayout) DF(CreateGraphicsPipelines) DF(DestroyPipeline)
     DF(CreateDescriptorSetLayout) DF(CreateDescriptorPool) DF(AllocateDescriptorSets) DF(UpdateDescriptorSets)
     DF(CmdSetViewport) DF(CmdSetScissor)
     DF(CreateQueryPool) DF(CmdWriteTimestamp) DF(GetQueryPoolResults) DF(CmdResetQueryPool)
@@ -216,6 +218,7 @@ struct DeviceData {
 
     // compositor role
     std::unordered_map<VkShaderModule, std::string> modName;
+    std::unordered_set<VkShaderModule> reverseMods;
     std::unordered_set<VkSampler> ycbcrSamplers;
     std::unordered_set<VkDescriptorSetLayout> ycbcrDsl;
     std::unordered_set<VkPipelineLayout> ycbcrPl;
@@ -315,7 +318,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     DF(CmdEndRenderPass2) DF(CmdBeginRendering) DF(CmdEndRendering) DF(CmdCopyImage) DF(CmdBlitImage)
     DF(QueueSubmit) DF(QueueSubmit2) DF(CreateSwapchainKHR) DF(BeginCommandBuffer) DF(EndCommandBuffer)
     DF(CmdPipelineBarrier) DF(CmdBindPipeline) DF(CmdDraw) DF(CmdBindDescriptorSets) DF(CmdPushConstants)
-    DF(CreateShaderModule) DF(DestroyShaderModule) DF(CreatePipelineLayout) DF(CreateGraphicsPipelines)
+    DF(CreateShaderModule) DF(DestroyShaderModule) DF(CreatePipelineLayout) DF(CreateGraphicsPipelines) DF(DestroyPipeline)
     DF(CreateDescriptorSetLayout) DF(CreateDescriptorPool) DF(AllocateDescriptorSets) DF(UpdateDescriptorSets)
     DF(CmdSetViewport) DF(CmdSetScissor) DF(CreateQueryPool) DF(CmdWriteTimestamp) DF(GetQueryPoolResults)
     DF(CmdResetQueryPool) DF(CmdClearColorImage) DF(CmdResolveImage) DF(CmdDispatch) DF(CmdCopyBufferToImage)
@@ -884,8 +887,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit2(VkQueue q, uint32_t n, const 
 // ---------------------------------------------------------------- proc addr
 #define HOOK(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)n;
 static PFN_vkVoidFunction deviceHook(const char *name) {
-    if (g_role == ROLE_COMPOSITOR) { // observe/override only; never touch the compositor's rendering
-        HOOK(DestroyDevice) HOOK(CreateShaderModule) HOOK(CreateSampler) HOOK(CreateDescriptorSetLayout)
+    if (g_role == ROLE_COMPOSITOR) { // named shader overrides and Camera key blend override
+        HOOK(DestroyDevice) HOOK(CreateShaderModule) HOOK(DestroyShaderModule) HOOK(CreateSampler) HOOK(CreateDescriptorSetLayout)
         HOOK(CreatePipelineLayout) HOOK(CreateGraphicsPipelines) HOOK(CreateComputePipelines) HOOK(CmdBindPipeline)
         HOOK(QueueSubmit) HOOK(QueueSubmit2) HOOK(CreateSamplerYcbcrConversion)
         HOOK(BindBufferMemory) HOOK(BindBufferMemory2) HOOK(MapMemory) HOOK(UnmapMemory) HOOK(UpdateDescriptorSets)

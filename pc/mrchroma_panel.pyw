@@ -50,7 +50,8 @@ class Panel:
         self.mode = tk.StringVar(value=self.s["mode"])
         mf = ttk.Frame(f)
         mf.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        for i, (lbl, val) in enumerate([("Off", "off"), ("Chroma key", "chroma"), ("Rect test", "rect")]):
+        for i, (lbl, val) in enumerate([("Off", "off"), ("Virtual key", "chroma"),
+                                        ("Camera key", "reverse"), ("Rect test", "rect")]):
             ttk.Radiobutton(mf, text=lbl, value=val, variable=self.mode, command=self.changed).grid(row=0, column=i, padx=4)
 
         ttk.Label(f, text="Key colour").grid(row=1, column=0, sticky="w")
@@ -133,8 +134,8 @@ class Panel:
             pass
         r, g, b = (c / 255.0 for c in self.s["rgb"])
         m = self.s["mode"]
-        if m == "chroma":
-            args = f"chroma {r:.4f} {g:.4f} {b:.4f} {self.s['threshold']} {self.s['softness']} {self.s['spill']}"
+        if m in ("chroma", "reverse"):
+            args = f"{m} {r:.4f} {g:.4f} {b:.4f} {self.s['threshold']} {self.s['softness']} {self.s['spill']}"
         elif m == "rect":
             args = "rect 0.3 0.3 0.7 0.7"
         else:

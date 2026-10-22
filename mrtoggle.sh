@@ -1,16 +1,12 @@
 #!/bin/bash
 # mrtoggle — switch chroma keying on/off without regenerating the shader.
 #   mrtoggle.sh on | off | toggle | status
-# "on" re-enables the last shader built by mrkey.sh (active_se2.spv), so the
-# key colour / threshold / softness / spill from the last panel session apply.
+# "on" re-enables the last shader mode and settings built by mrkey.sh.
 set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
 SHADER=distort_ps_achromatic_se2.spv
-STATE="$HOME/.local/share/mrchroma"
 CONF="$HOME/.config/mrchroma/mrchroma.conf"
-ACTIVE="$STATE/active_se2.spv"
-LINE="override = $SHADER $ACTIVE"
-
-is_on() { grep -q "^override = $SHADER " "$CONF" 2>/dev/null; }
+is_on() { grep -q "^override = $SHADER " "$CONF" 2>/dev/null || grep -q '^reverse = 1$' "$CONF" 2>/dev/null; }
 
 # PC home background (applied on the PC by pc/mrchroma_pcsync.pyw):
 #   mrtoggle.sh bg on | off | toggle | status
@@ -39,15 +35,9 @@ case "$cmd" in
     if is_on; then echo on; else echo off; fi
     exit 0 ;;
   on)
-    if [[ ! -s "$ACTIVE" ]]; then
-      echo "mrtoggle: no $ACTIVE yet - run mrkey.sh chroma ... once" >&2
-      exit 1
-    fi
-    is_on || echo "$LINE" >> "$CONF" ;;
+    if ! is_on; then "$DIR/mrkey.sh" activate >/dev/null; fi ;;
   off)
-    sed -i "/^override = $SHADER /d" "$CONF" ;;
+    if is_on; then "$DIR/mrkey.sh" deactivate >/dev/null; fi ;;
   *) sed -n '2,5p' "$0"; exit 2 ;;
 esac
-touch "$CONF"
-LD_LIBRARY_PATH=/opt/steamvr/bin/linuxarm64 timeout 10 /opt/steamvr/bin/linuxarm64/vrcmd --reload-shaders >/dev/null 2>&1 || true
 echo "$cmd"

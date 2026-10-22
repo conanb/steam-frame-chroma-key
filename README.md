@@ -4,15 +4,18 @@ Mixed reality on the Steam Frame over Valve's normal PC streaming, with no ALVR 
 
 Paint your SteamVR game's background a solid colour (for example pure green) and the Steam Frame
 replaces that colour with its own passthrough camera. Valve's native streaming (vrlink, hardware decode) is unchanged.
-No second video stream is added, the camera image never leaves the headset, and the cost is about 0.3 ms of GPU time
-with no extra frame of latency.
+No second video stream is added, and the camera image never leaves the headset. Virtual key was measured at about
+0.3 ms of GPU time with no extra frame of latency; Camera key has not been benchmarked yet.
+
+**Camera key** mode reverses the effect: a real-world greenscreen reveals the streamed virtual scene, while the
+rest of the camera view remains visible. This mode is newly implemented and still needs headset validation.
 
 ![The Chroma Key panel in the SteamVR dashboard](docs/panel.png)
 
 What you get:
 
 - **In-headset panel** in the SteamVR dashboard: keying ON/OFF, key colour presets and hue bar, Similarity, Edge
-  softness, Spill and **Passthrough** brightness sliders.
+  softness, Spill and **Passthrough** brightness sliders, plus Virtual key / Camera key selection.
 - **Full-brightness passthrough**: the room behind the game is as bright as SteamVR's own pass-through view
   (SteamVR normally dims it while a game runs), adjustable with the Passthrough slider.
 - **Standalone stays stock**: keying only applies while you stream from the PC; standalone apps and Room View
@@ -21,7 +24,7 @@ What you get:
   backdrop the key colour, so you see your room around the SteamVR desktop view. Switch back to the default
   mountains with one click.
 - **PC control panel** (optional): eyedropper to sample the background colour straight off your monitor, a colour
-  picker and the same sliders.
+  picker and the same sliders. The eyedropper samples the PC screen, so use the colour picker for a real greenscreen.
 - Everything is user-scope. Nothing under `/usr` or `/opt` is modified, and `uninstall.sh` rolls it all back.
 
 > **Warning**
@@ -106,6 +109,11 @@ toggle/install_toggle.sh                   # in-headset dashboard panel (recomme
 
 Your settings persist across SteamVR restarts and reboots.
 
+To key a real greenscreen instead, run `./mrkey.sh reverse 0 1 0 0.32 0.12 0.5` or select **Camera key** in the panel.
+
+For an existing installation, bring these changes into `~/mr-chroma`, run `./build.sh && ./install.sh`, restart
+SteamVR, and rerun `toggle/install_toggle.sh` to install the updated dashboard panel. Then run `./mrkey.sh reverse ...`.
+
 ### 4. PC tools (optional)
 
 From a copy of this repo on the PC:
@@ -121,12 +129,14 @@ From a copy of this repo on the PC:
 
 ## Using it
 
-1. In your game, make the background a solid colour, such as pure green `(0, 255, 0)`, using an
-   unlit skybox, scene background or large plane.
+1. For **Virtual key**, make the game's background a solid colour, such as pure green `(0, 255, 0)`, using an
+   unlit skybox, scene background or large plane. For **Camera key**, put a green surface in the real room and
+   render the virtual content you want to see behind it in the streamed scene.
 2. Stream to the Frame as usual through SteamVR (normal **OpenVR** mode, not Virtual Desktop).
 3. Open the SteamVR dashboard and click the **Chroma Key** icon in the bottom bar.
    - **ON/OFF** toggles keying.
-   - Pick a **key colour** preset or drag the **hue** bar to match your background.
+   - Select **Virtual key** to replace a colour in the game, or **Camera key** to replace a colour seen by the camera.
+   - Pick a **key colour** preset or drag the **hue** bar to match the keyed surface.
    - **Similarity** sets how far from the key colour still counts as background. Raise it if patches of
      background remain, and lower it if parts of your subject disappear.
    - **Edge softness** sets the width of the fade at edges.
@@ -144,6 +154,7 @@ From a shell on the headset you can do the same things:
 ```bash
 ~/mr-chroma/mrtoggle.sh on|off|toggle|status       # keying on/off, keeps the last colour/settings
 ~/mr-chroma/mrkey.sh chroma R G B sim soft spill   # set colour + params (0..1 values)
+~/mr-chroma/mrkey.sh reverse R G B sim soft spill  # real-world colour reveals virtual scene
 ~/mr-chroma/mrkey.sh passthru 1.6667 <brightness> # passthrough brightness (1 = normal), "off" = stock
 ~/mr-chroma/mrkey.sh rect                          # debug: key a fixed rectangle in the middle of each eye
 ~/mr-chroma/mrtoggle.sh bg on|off|toggle|status    # PC desktop background: key colour / mountains
@@ -185,6 +196,13 @@ times within 120 s with the layer loaded, the layer stops loading and writes
    memory for a patched SPIR-V. The patched shader computes alpha from a CbCr-distance chroma key, with smoothstep
    edge softness and spill suppression, and writes premultiplied `(rgb·a, a)`.
 
+**Camera key** leaves the scene shader opaque. It patches the two tracked-camera fragment shaders to measure camera
+chroma, suppress matching camera colour and output a camera visibility alpha. The layer changes only those camera
+pipelines to blend `source = ONE, destination = ONE_MINUS_SRC_ALPHA`, yielding
+`virtual × (1 − opacity × visibility) + camera × opacity × visibility`. Camera chroma is normalized before comparison
+because the compositor dims the passthrough image. The shader leaves the opacity-1 pass-only Room View unkeyed.
+The effect uses the compositor's own camera reprojection.
+
 **Standalone.** `forceSceneAlphaBlending` is a global setting, but only the streamed scene is keyed; native apps
 and SteamVR Home don't write full alpha, so the room would show faintly through everything in standalone. The panel
 therefore keeps the setting on only while a PC stream (`vrlink`) is running, and removes it otherwise.
@@ -205,8 +223,8 @@ tracking and reprojection are the compositor's own.
 |---|---|
 | `layer/mrchroma_layer.cpp`, `layer/compositor_hooks.inc` | The Vulkan layer. It loads only into `vrcompositor` (opt-in flag file) and `vrlink` (log only). Every other process gets "Skipping layer" from the loader. |
 | `tools/gen_key_spv.py` | Patches the compositor shader disassembly into a rect-test or chroma-key variant, then assembles and validates it. |
-| `tools/gen_cam_spv.py` | Patches the two passthrough camera shaders for brightness (`mrkey.sh passthru`). |
-| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill` / `passthru match brightness`. Regenerates the shader and hot-reloads compositor shaders (`vrcmd --reload-shaders`). |
+| `tools/gen_cam_spv.py` | Patches the two passthrough camera shaders for brightness and Camera key. |
+| `mrkey.sh` | `off` / `rect` / `chroma R G B threshold softness spill` / `reverse R G B threshold softness spill` / `passthru match brightness`. Regenerates shaders and hot-reloads them (`vrcmd --reload-shaders`). |
 | `mrtoggle.sh` | `on` / `off` / `toggle` / `status`, plus `bg ...`. Re-enables the last generated shader without regenerating it. |
 | `tools/mrctl.cpp` | OpenVR helper: get/set settings, measure frame timing (`mrctl timing 8`). |
 | `toggle/` | The SteamVR dashboard overlay. It is software-rendered with FreeType via `SetOverlayRaw` and autolaunched through a user app manifest (`mrchroma.toggle`). It also keeps `forceSceneAlphaBlending` on only while streaming. `mrtoggle_overlay --render out.ppm` renders the layout without SteamVR. |
@@ -231,10 +249,10 @@ because they draw their own background.
 
 ## Fragility
 
-The patchers anchor on this SteamVR build's shader code (`OpStore %504 %994` for the key, the uniform layout for
-the camera shaders). After a SteamVR update,
-`gen_key_spv.py` refuses to generate a shader ("unexpected shader layout") instead of producing a broken one. If the
-compositor rejects a patched module, the layer falls back to the original shader. The shader filename and the
+The patchers anchor on this SteamVR build's shader code (`OpStore %504 %994` for Virtual key, the uniform and
+fragment-output layout for the camera shaders). After a SteamVR update, the generators refuse unfamiliar layouts.
+If the compositor rejects a patched module or reverse blend pipeline, the layer retries the original module or
+pipeline; Camera key may then show only the virtual scene until disabled. The shader filename and the
 `forceSceneAlphaBlending` setting are internal SteamVR details that Valve can change at any time. Porting to a new
 SteamVR build means re-deriving those anchors from the new `distort_ps_achromatic_se2.spv` disassembly. Issues and
 PRs are welcome.
