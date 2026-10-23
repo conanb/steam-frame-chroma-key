@@ -8,7 +8,8 @@ No second video stream is added, and the camera image never leaves the headset. 
 0.3 ms of GPU time with no extra frame of latency; Camera key has not been benchmarked yet.
 
 **Camera key** mode reverses the effect: a real-world greenscreen reveals the streamed virtual scene, while the
-rest of the camera view remains visible. This mode is newly implemented and still needs headset validation.
+rest of the camera view remains visible. This mode has been validated in-headset during PC streaming but has not
+been benchmarked yet.
 
 ![The Chroma Key panel in the SteamVR dashboard](docs/panel.png)
 
@@ -199,8 +200,9 @@ times within 120 s with the layer loaded, the layer stops loading and writes
 **Camera key** leaves the scene shader opaque. It patches the two tracked-camera fragment shaders to measure camera
 chroma, suppress matching camera colour and output a camera visibility alpha. The layer changes only those camera
 pipelines to blend `source = ONE, destination = ONE_MINUS_SRC_ALPHA`, yielding
-`virtual × (1 − opacity × visibility) + camera × opacity × visibility`. Camera chroma is normalized before comparison
-because the compositor dims the passthrough image. The shader leaves the opacity-1 pass-only Room View unkeyed.
+`virtual × (1 − visibility) + camera × visibility`. Camera chroma is normalized before comparison because the
+compositor dims the passthrough image. The camera mask controls blend alpha directly so the streamed virtual scene
+does not bleed through the visible camera; the shader leaves the opacity-1 pass-only Room View unkeyed.
 The effect uses the compositor's own camera reprojection.
 
 **Standalone.** `forceSceneAlphaBlending` is a global setting, but only the streamed scene is keyed; native apps

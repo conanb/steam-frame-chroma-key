@@ -27,7 +27,10 @@ is_active() {
 camera_name() { echo "tracked_camera_reprojection_simplified_${1}_nv12_ps.spv"; }
 reload_shaders() {
   touch "$CONF"
-  LD_LIBRARY_PATH=/opt/steamvr/bin/linuxarm64 timeout 10 /opt/steamvr/bin/linuxarm64/vrcmd --reload-shaders || true
+  if ! LD_LIBRARY_PATH=/opt/steamvr/bin/linuxarm64 timeout 10 /opt/steamvr/bin/linuxarm64/vrcmd --reload-shaders; then
+    echo 'mrkey: SteamVR shader reload failed; restart SteamVR to apply the mode change' >&2
+    return 1
+  fi
 }
 camera_settings() {
   local gain=1 bright=1
@@ -63,6 +66,10 @@ set_overrides() {
         path="$STATE/active_reverse_cam_$v.spv"
         [[ -s "$path" ]] || { echo "mrkey: missing $path; run mrkey.sh reverse ..." >&2; exit 1; }
       done
+      # Keep an explicit scene override so shader reload replaces any cached
+      # virtual-key module with SteamVR's original opaque scene shader.
+      cp "$ORIG" "$OUT.new"
+      mv "$OUT.new" "$OUT"
     else
       [[ -s "$OUT" ]] || { echo "mrkey: missing $OUT; run mrkey.sh chroma ..." >&2; exit 1; }
     fi
@@ -70,6 +77,7 @@ set_overrides() {
   sed -i "/^override = $SHADER /d; /^override = tracked_camera_reprojection_simplified_.*_nv12_ps.spv /d; /^reverse = /d" "$CONF"
   if [[ "$selected" == on ]]; then
     if [[ "$(active_mode)" == reverse ]]; then
+      echo "override = $SHADER $OUT" >> "$CONF"
       for v in sharpen_rgb rgb; do
         cam=$(camera_name "$v")
         path="$STATE/active_reverse_cam_$v.spv"

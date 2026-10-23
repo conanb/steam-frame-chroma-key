@@ -222,7 +222,8 @@ enum Sync { SyncOk, SyncWaiting, SyncStale };
 
 enum Drag { DragNone = -1, DragHue = 10 };   // 0..3 = slider index
 
-static void render(Canvas &cv, const Key &k, const std::string &status, bool busy, int drag, const PcBg &bg, Sync sync) {
+static void render(Canvas &cv, const Key &k, const std::string &status, bool busy, bool failed, int drag,
+                   const PcBg &bg, Sync sync) {
     cv.clear();
     cv.rrect(0, 0, W, H, 40, 0x1c1d22, 0.94f);
     cv.ring(4, 4, W - 4, H - 4, 36, 4, 0x4a4d57);
@@ -290,8 +291,10 @@ static void render(Canvas &cv, const Key &k, const std::string &status, bool bus
     }
     const char *st = sync == SyncOk ? "PC in sync" : sync == SyncWaiting ? "waiting for PC..." : "PC helper not responding";
     cv.text(st, 996, 800, 22, sync == SyncOk ? 0x5ae678 : sync == SyncWaiting ? 0xe0b050 : 0xeb5f55, false, 2);
-    cv.text(on ? "Changes apply when you release the trigger"
-               : "Changing colour or sliders turns keying back on", W / 2, H - 22, 24, 0x80838c, false, 1);
+    cv.text(failed ? "Change failed - see /tmp/mrtoggle_overlay.log"
+                   : on ? "Changes apply when you release the trigger"
+                        : "Changing colour or sliders turns keying back on",
+            W / 2, H - 22, 24, failed ? 0xeb5f55 : 0x80838c, false, 1);
 }
 
 // ---------------------------------------------------------------- main
@@ -317,7 +320,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--render")) {   // layout check without SteamVR: --render out.ppm
         Key k;
         readState(k);
-        render(cv, k, "on", false, DragNone, PcBg{true, ""}, SyncOk);
+        render(cv, k, "on", false, false, DragNone, PcBg{true, ""}, SyncOk);
         FILE *f = fopen(argv[2], "wb");
         fprintf(f, "P6 %d %d 255\n", W, H);
         for (int i = 0; i < W * H; i++) {
@@ -382,6 +385,7 @@ int main(int argc, char **argv) {
     std::mutex m;
     std::string pending;
     std::atomic<bool> busy{false};
+    std::atomic<bool> commandFailed{false};
     bool quit = false;
     std::thread worker([&] {
         while (true) {
@@ -393,7 +397,9 @@ int main(int argc, char **argv) {
             }
             if (cmd.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
             busy = true;
-            if (system((cmd + " >/dev/null 2>&1").c_str()) != 0) fprintf(stderr, "failed: %s\n", cmd.c_str());
+            bool failed = system((cmd + " >/dev/null").c_str()) != 0;
+            if (failed) fprintf(stderr, "failed: %s\n", cmd.c_str());
+            commandFailed = failed;
             busy = false;
         }
     });
@@ -501,6 +507,9 @@ int main(int argc, char **argv) {
             std::string ack = readWord(bgAckPath);
             if (want != bg.on || ack != bg.applied) { bg.on = want; bg.applied = ack; dirty = true; }
         }
+        static bool lastFailed = false;
+        bool failed = commandFailed;
+        if (failed != lastFailed) { lastFailed = failed; dirty = true; }
         static bool lastSynced = true;
         bool synced = inSync();
         if (synced) mismatchSince = now;
@@ -508,7 +517,7 @@ int main(int argc, char **argv) {
         static Sync lastSync = SyncOk;
         if (sync != lastSync || synced != lastSynced) { lastSync = sync; lastSynced = synced; dirty = true; }
         if (dirty && now - lastDraw > std::chrono::milliseconds(50)) {
-            render(cv, key, status, busy, drag, bg, sync);
+            render(cv, key, status, busy, failed, drag, bg, sync);
             ov->SetOverlayRaw(main, cv.px.data(), W, H, 4);
             lastDraw = now;
             dirty = false;

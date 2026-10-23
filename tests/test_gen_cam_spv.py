@@ -14,7 +14,7 @@ spec.loader.exec_module(gen)
 
 CAMERA_ASM = '''%1 = OpExtInstImport "GLSL.std.450"
 OpMemberDecorate %ubo_type 9 Offset 304
-%out = OpVariable %_ptr_Output_v4float Output
+        %out = OpVariable %_ptr_Output_v4float Output
 %4 = OpFunction %void None %3
 %tc = OpAccessChain %_ptr_Uniform_v4float %ubo %int_9
 %tv = OpLoad %v4float %tc
@@ -22,7 +22,11 @@ OpMemberDecorate %ubo_type 9 Offset 304
 %ac = OpAccessChain %_ptr_Uniform_float %ubo %int_9 %uint_3
 %op = OpLoad %float %ac
 %mul = OpVectorTimesScalar %v3float %camera_tinted %op
-OpStore %out %result
+%result = OpCompositeConstruct %v4float %r %g %b %op
+OpBranch %end
+%end = OpLabel
+%joined = OpPhi %v4float %original %start %result %camera
+OpStore %out %joined
 OpFunctionEnd
 '''
 
@@ -40,17 +44,18 @@ class CameraGeneratorTest(unittest.TestCase):
 
     def test_brightness_variant_keeps_original_output(self):
         asm = self.generate(["1.6667", "1.2"])
-        self.assertIn("OpStore %out %result", asm)
+        self.assertIn("%result = OpCompositeConstruct %v4float %r %g %b %op", asm)
         self.assertNotIn("%mk_mask", asm)
 
     def test_reverse_variant_masks_camera_rgb_and_alpha(self):
         asm = self.generate(["1.6667", "1.2", "reverse", "0", "1", "0", "0.18", "0.1", "0.5"])
         self.assertIn("%mk_len = OpExtInst %float %1 Length %camera_tinted", asm)
-        self.assertIn("%mk_alpha = OpFMul %float %op %mk_visible", asm)
+        self.assertIn("%mk_alpha = OpSelect %float %mk_stream %mk_mask %op", asm)
         self.assertIn("%mk_rgb = OpVectorTimesScalar %v3float %mk_clean %mk_visible", asm)
         self.assertIn("%mk_visible = OpSelect %float %mk_stream %mk_mask %mk_one", asm)
-        self.assertIn("OpStore %out %mk_out", asm)
-        self.assertNotIn("OpStore %out %result", asm)
+        self.assertIn("%result = OpCompositeConstruct %v4float %mk_o0 %mk_o1 %mk_o2 %mk_alpha", asm)
+        self.assertIn("%joined = OpPhi %v4float %original %start %result %camera", asm)
+        self.assertIn("OpStore %out %joined", asm)
 
     def test_unknown_output_layout_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "unexpected shader layout"):

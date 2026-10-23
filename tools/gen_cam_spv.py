@@ -24,6 +24,8 @@ The result is premultiplied by the camera visibility mask. The Vulkan layer chan
 the camera pipeline blend to ONE / ONE_MINUS_SRC_ALPHA for this variant.
 The pass-only camera view uses opacity 1; its key mask is forced to 1 so Room View
 remains opaque. The streamed scene blend was measured at opacity 0.6.
+Reverse mode uses the visibility mask as its blend alpha during streaming; using
+SteamVR's 0.6 camera opacity would leave 40% of the virtual scene showing through.
 """
 import math
 from pathlib import Path
@@ -34,13 +36,14 @@ import sys
 # the opacity (ubo member 9 .w) load that feeds  rgb * opacity
 OPACITY_RE = re.compile(r"(%\w+) = OpAccessChain %_ptr_Uniform_float %\w+ %int_9 %uint_3\n"
                         r"(\s*)(%\w+) = OpLoad %float \1\n"
-                        r"(\s*%\w+ = OpVectorTimesScalar %v3float (%\w+) )\3\n")
+                        r"(\s*(%\w+) = OpVectorTimesScalar %v3float (%\w+) )\3\n")
 # tint.rgb = shuffle(load(ubo member 9))
 TINT_RE = re.compile(r"(%\w+) = OpAccessChain %_ptr_Uniform_v4float %\w+ %int_9\n"
                      r"(\s*)(%\w+) = OpLoad %v4float \1\n"
                      r"\s*(%\w+) = OpVectorShuffle %v3float \3 \3 0 1 2\n")
 FUNC = "%4 = OpFunction %void None %3"
-OUTPUT_RE = re.compile(r"^(%\w+) = OpVariable %_ptr_Output_v4float Output$", re.M)
+OUTPUT_RE = re.compile(r"^[ \t]*(%\w+) = OpVariable %_ptr_Output_v4float Output$", re.M)
+COMPOSITE_RE = re.compile(r"^([ \t]*)(%\w+) = OpCompositeConstruct %v4float %\w+ %\w+ %\w+ %\w+$", re.M)
 
 
 def only(regex, asm, what):
@@ -68,7 +71,8 @@ def main():
     ]
     m = only(OPACITY_RE, asm, "opacity load")
     ind = m.group(2)
-    camera_rgb = m.group(5)
+    scaled_rgb = m.group(5)
+    camera_rgb = m.group(6)
     opacity = m.group(3)
     repl = (m.group(0)[:m.start(4) - m.start(0)]
             + ind + "%mk_og = OpFMul %float " + m.group(3) + " %mk_gain\n"
@@ -88,8 +92,14 @@ def main():
     if reverse:
         # Locate the single fragment colour output; refuse to patch a changed shader layout.
         output_var = only(OUTPUT_RE, asm, "fragment output").group(1)
-        store = only(re.compile(r"^([ \t]*)OpStore " + re.escape(output_var) + r" (%\w+)$", re.M),
+        store = only(re.compile(r"^[ \t]*OpStore " + re.escape(output_var) + r" (%\w+)$", re.M),
                      asm, "fragment output store")
+        start = asm.index(scaled_rgb + " = OpVectorTimesScalar")
+        construct = only(COMPOSITE_RE, asm[start:store.start()], "camera output construct")
+        output_value = construct.group(2)
+        assert re.search(r"^[ \t]*" + re.escape(store.group(1)) + r" = OpPhi %v4float .*"
+                         + re.escape(output_value) + r"(?=\s|$)", asm[construct.end() + start:store.start()], re.M), \
+            "unexpected shader layout (SteamVR update?): camera output phi"
         norm = math.sqrt(red * red + green * green + blue * blue)
         assert norm > 0, "reverse key colour cannot be black"
         red, green, blue = red / norm, green / norm, blue / norm
@@ -111,7 +121,6 @@ def main():
             "%mk_t3 = OpConstant %float " + repr(threshold + 3 * softness),
             "%mk_sp = OpConstant %float " + repr(spill),
         ]
-        value = store.group(2)
         code = [
             "%mk_len = OpExtInst %float %1 Length " + camera_rgb,
             "%mk_safe = OpExtInst %float %1 FMax %mk_len %mk_eps",
@@ -133,23 +142,23 @@ def main():
             "%mk_wi = OpFSub %float %mk_one %mk_ws",
             "%mk_wraw = OpFMul %float %mk_wi %mk_sp",
             "%mk_w = OpSelect %float %mk_stream %mk_wraw %mk_f0",
-            "%mk_raw = OpVectorShuffle %v3float " + value + " " + value + " 0 1 2",
-            "%mk_or = OpCompositeExtract %float %mk_raw 0",
-            "%mk_ogreen = OpCompositeExtract %float %mk_raw 1",
-            "%mk_ob = OpCompositeExtract %float %mk_raw 2",
+            "%mk_or = OpCompositeExtract %float " + scaled_rgb + " 0",
+            "%mk_ogreen = OpCompositeExtract %float " + scaled_rgb + " 1",
+            "%mk_ob = OpCompositeExtract %float " + scaled_rgb + " 2",
             "%mk_rb = OpExtInst %float %1 FMax %mk_or %mk_ob",
             "%mk_gc = OpExtInst %float %1 FMin %mk_ogreen %mk_rb",
             "%mk_g2 = OpExtInst %float %1 FMix %mk_ogreen %mk_gc %mk_w",
             "%mk_clean = OpCompositeConstruct %v3float %mk_or %mk_g2 %mk_ob",
             "%mk_rgb = OpVectorTimesScalar %v3float %mk_clean %mk_visible",
-            "%mk_alpha = OpFMul %float " + opacity + " %mk_visible",
+            "%mk_alpha = OpSelect %float %mk_stream %mk_mask " + opacity,
             "%mk_o0 = OpCompositeExtract %float %mk_rgb 0",
             "%mk_o1 = OpCompositeExtract %float %mk_rgb 1",
             "%mk_o2 = OpCompositeExtract %float %mk_rgb 2",
-            "%mk_out = OpCompositeConstruct %v4float %mk_o0 %mk_o1 %mk_o2 %mk_alpha",
-            "OpStore " + output_var + " %mk_out",
+            output_value + " = OpCompositeConstruct %v4float %mk_o0 %mk_o1 %mk_o2 %mk_alpha",
         ]
-        asm = asm[:store.start()] + store.group(1) + ("\n" + store.group(1)).join(code) + asm[store.end():]
+        offset = start + construct.start()
+        indent = construct.group(1)
+        asm = asm[:offset] + indent + ("\n" + indent).join(code) + asm[start + construct.end():]
     asm = asm.replace(FUNC, "\n".join(consts) + "\n" + FUNC)
     tmp = out + ".spvasm"
     Path(tmp).write_text(asm)
